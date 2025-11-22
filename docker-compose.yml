@@ -1,0 +1,33 @@
+services:
+  garmin-mcp:
+    build: .
+    container_name: garmin-mcp-server
+    expose:
+      - "8000"
+    volumes:
+      - ~/.garminconnect:/root/.garminconnect:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/sse"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: garmin-mcp-proxy
+    ports:
+      - "443:443"
+      - "8000:8000"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - garmin-mcp
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
