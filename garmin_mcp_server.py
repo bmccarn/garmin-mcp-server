@@ -456,12 +456,17 @@ def get_training_status() -> dict:
     try:
         status = client.get_training_status(today)
         if status:
+            # Extract from nested objects if present
+            vo2_max_obj = status.get("mostRecentVO2Max", {}) if isinstance(status.get("mostRecentVO2Max"), dict) else {}
+            training_status_obj = status.get("mostRecentTrainingStatus", {}) if isinstance(status.get("mostRecentTrainingStatus"), dict) else {}
+            load_balance_obj = status.get("mostRecentTrainingLoadBalance", {}) if isinstance(status.get("mostRecentTrainingLoadBalance"), dict) else {}
+
             return {
-                "training_status": status.get("trainingStatusLabel"),
-                "vo2_max": status.get("vo2MaxValue"),
-                "weekly_load": status.get("weeklyLoadTotal"),
-                "acute_load": status.get("acuteLoad"),
-                "chronic_load": status.get("chronicLoad"),
+                "training_status": training_status_obj.get("trainingStatusLabel") or training_status_obj.get("trainingStatusKey"),
+                "vo2_max": vo2_max_obj.get("vo2MaxValue") or vo2_max_obj.get("vo2Max"),
+                "weekly_load": load_balance_obj.get("weeklyLoadTotal"),
+                "acute_load": load_balance_obj.get("acuteLoad"),
+                "chronic_load": load_balance_obj.get("chronicLoad"),
             }
         return {"error": "No training status available"}
     except Exception as e:
@@ -501,24 +506,46 @@ def get_body_composition() -> dict:
     """
     client = get_garmin_client()
     today = date.today().isoformat()
-    start = (date.today() - timedelta(days=30)).isoformat()
+    start = (date.today() - timedelta(days=90)).isoformat()
 
     try:
+        # Try weight API first (more reliable)
+        try:
+            weight_data = client.get_weigh_ins(start, today)
+            if weight_data and len(weight_data) > 0:
+                latest = weight_data[0]  # Most recent
+                weight_kg = latest.get("weight") / 1000 if latest.get("weight") else None
+
+                return {
+                    "weight_kg": round(weight_kg, 2) if weight_kg else None,
+                    "weight_lb": round(weight_kg * 2.20462, 2) if weight_kg else None,
+                    "bmi": latest.get("bmi"),
+                    "body_fat_percent": latest.get("bodyFatPercentage"),
+                    "body_water_percent": latest.get("bodyWaterPercentage"),
+                    "bone_mass_kg": latest.get("boneMassInGrams", 0) / 1000 if latest.get("boneMassInGrams") else None,
+                    "muscle_mass_kg": latest.get("muscleMassInGrams", 0) / 1000 if latest.get("muscleMassInGrams") else None,
+                }
+        except Exception:
+            pass
+
+        # Fallback to body composition API
         bc = client.get_body_composition(start, today)
-        if bc:
-            weight_g = bc.get("weight", 0)
+        if bc and isinstance(bc, list) and len(bc) > 0:
+            latest = bc[-1]  # Get most recent entry
+            weight_g = latest.get("weight", 0)
             weight_kg = weight_g / 1000 if weight_g else None
             weight_lb = weight_kg * 2.20462 if weight_kg else None
 
             return {
                 "weight_kg": round(weight_kg, 1) if weight_kg else None,
                 "weight_lb": round(weight_lb, 1) if weight_lb else None,
-                "bmi": bc.get("bmi"),
-                "body_fat_percent": bc.get("bodyFat"),
-                "body_water_percent": bc.get("bodyWater"),
-                "bone_mass_kg": bc.get("boneMass"),
-                "muscle_mass_kg": bc.get("muscleMass"),
+                "bmi": latest.get("bmi"),
+                "body_fat_percent": latest.get("bodyFat"),
+                "body_water_percent": latest.get("bodyWater"),
+                "bone_mass_kg": latest.get("boneMass"),
+                "muscle_mass_kg": latest.get("muscleMass"),
             }
+
         return {"error": "No body composition data available"}
     except Exception as e:
         return {"error": str(e)}
@@ -534,14 +561,29 @@ def get_personal_records() -> list:
     try:
         records = client.get_personal_record()
         if records:
-            return [
-                {
-                    "type": record.get("typeKey"),
+            result = []
+            for record in records[:20]:
+                # Try multiple possible field names
+                record_type = (
+                    record.get("typeKey") or
+                    record.get("prType") or
+                    record.get("recordType") or
+                    "Unknown"
+                )
+
+                # Convert timestamp if it's in milliseconds
+                date_value = record.get("prStartTimeLocal") or record.get("prStartTime") or record.get("startTime")
+                if date_value and isinstance(date_value, int):
+                    # Convert milliseconds to date string
+                    date_value = datetime.fromtimestamp(date_value / 1000).strftime("%Y-%m-%d")
+
+                result.append({
+                    "type": record_type,
                     "value": record.get("value"),
-                    "date": record.get("prStartTimeLocal"),
-                }
-                for record in records[:20]
-            ]
+                    "date": date_value,
+                    "unit": record.get("metricKey"),
+                })
+            return result
         return []
     except Exception as e:
         return [{"error": str(e)}]
@@ -1111,18 +1153,18 @@ def get_hydration(date_str: str = "today") -> dict:
     try:
         hydration = client.get_hydration_data(date_str)
         if hydration:
-            goal_ml = hydration.get("goalInML", 0)
-            intake_ml = hydration.get("valueInML", 0)
+            goal_ml = hydration.get("goalInML") or 0
+            intake_ml = hydration.get("valueInML") or 0
 
             return {
                 "date": date_str,
                 "intake_ml": intake_ml,
-                "intake_oz": round(intake_ml * 0.033814, 1),
+                "intake_oz": round(intake_ml * 0.033814, 1) if intake_ml else 0,
                 "goal_ml": goal_ml,
-                "goal_oz": round(goal_ml * 0.033814, 1),
+                "goal_oz": round(goal_ml * 0.033814, 1) if goal_ml else 0,
                 "remaining_ml": max(0, goal_ml - intake_ml),
                 "progress_pct": round(intake_ml / goal_ml * 100, 1) if goal_ml else 0,
-                "sweat_loss_ml": hydration.get("sweatLossInML", 0),
+                "sweat_loss_ml": hydration.get("sweatLossInML") or 0,
             }
         return {"date": date_str, "error": "No hydration data available"}
     except Exception as e:
