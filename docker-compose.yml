@@ -2,6 +2,8 @@ services:
   garmin-mcp:
     build: .
     container_name: garmin-mcp-server
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     ports:
       - "8000:8000"
     volumes:

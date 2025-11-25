@@ -247,10 +247,10 @@ def get_sleep(date_str: str = "today") -> dict:
                 "sleep_start": daily.get("sleepStartTimestampLocal"),
                 "sleep_end": daily.get("sleepEndTimestampLocal"),
                 "total_sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
-                "deep_sleep_hours": round(daily.get("deepSleepSeconds", 0) / 3600, 2),
-                "light_sleep_hours": round(daily.get("lightSleepSeconds", 0) / 3600, 2),
-                "rem_sleep_hours": round(daily.get("remSleepSeconds", 0) / 3600, 2),
-                "awake_hours": round(daily.get("awakeSleepSeconds", 0) / 3600, 2),
+                "deep_sleep_hours": round((daily.get("deepSleepSeconds") or 0) / 3600, 2),
+                "light_sleep_hours": round((daily.get("lightSleepSeconds") or 0) / 3600, 2),
+                "rem_sleep_hours": round((daily.get("remSleepSeconds") or 0) / 3600, 2),
+                "awake_hours": round((daily.get("awakeSleepSeconds") or 0) / 3600, 2),
                 "sleep_score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
             }
         return {"date": date_str, "error": "No data available"}
