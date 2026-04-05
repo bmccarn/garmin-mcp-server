@@ -19,5 +19,5 @@ RUN mkdir -p /root/.garminconnect
 # Expose the MCP server port
 EXPOSE 8000
 
-# Run the MCP server with SSE transport
-CMD ["fastmcp", "run", "garmin_mcp_server.py", "--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]
+# Run the MCP server with Streamable HTTP transport (for native Open WebUI MCP support)
+CMD ["fastmcp", "run", "garmin_mcp_server.py", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]

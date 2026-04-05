@@ -20,6 +20,20 @@ TOKEN_DIR = Path.home() / ".garminconnect"
 # Global client instance
 _garmin_client: Optional[Garmin] = None
 
+# Conversion constants
+KM_TO_MILES = 0.621371
+METERS_TO_MILES = 0.000621371
+
+
+def km_to_miles(km: float) -> float:
+    """Convert kilometers to miles."""
+    return round(km * KM_TO_MILES, 2)
+
+
+def meters_to_miles(meters: float) -> float:
+    """Convert meters to miles."""
+    return round(meters * METERS_TO_MILES, 2)
+
 
 def get_garmin_client() -> Garmin:
     """Get or create the Garmin client with authentication."""
@@ -91,7 +105,9 @@ def get_todays_summary() -> dict:
         if stats:
             summary["steps"] = stats.get("totalSteps", 0)
             summary["step_goal"] = stats.get("dailyStepGoal", 0)
-            summary["distance_km"] = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+            distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+            summary["distance_km"] = distance_km
+            summary["distance_miles"] = km_to_miles(distance_km)
             summary["active_calories"] = stats.get("activeKilocalories", 0)
             summary["total_calories"] = stats.get("totalKilocalories", 0)
             summary["floors_climbed"] = stats.get("floorsAscended", 0)
@@ -167,12 +183,15 @@ def get_daily_stats(date_str: str = "today") -> dict:
     try:
         stats = client.get_stats(date_str)
         if stats:
+            distance_meters = stats.get("totalDistanceMeters", 0)
+            distance_km = round(distance_meters / 1000, 2)
             return {
                 "date": date_str,
                 "steps": stats.get("totalSteps", 0),
                 "step_goal": stats.get("dailyStepGoal", 0),
-                "distance_meters": stats.get("totalDistanceMeters", 0),
-                "distance_km": round(stats.get("totalDistanceMeters", 0) / 1000, 2),
+                "distance_meters": distance_meters,
+                "distance_km": distance_km,
+                "distance_miles": km_to_miles(distance_km),
                 "active_calories": stats.get("activeKilocalories", 0),
                 "total_calories": stats.get("totalKilocalories", 0),
                 "floors_climbed": stats.get("floorsAscended", 0),
@@ -421,12 +440,14 @@ def get_recent_activities(limit: int = 10) -> list:
         if activities:
             result = []
             for activity in activities:
+                distance_km = round(activity.get("distance", 0) / 1000, 2)
                 act = {
                     "name": activity.get("activityName"),
                     "type": activity.get("activityType", {}).get("typeKey"),
                     "date": activity.get("startTimeLocal"),
                     "duration_minutes": round(activity.get("duration", 0) / 60, 1),
-                    "distance_km": round(activity.get("distance", 0) / 1000, 2),
+                    "distance_km": distance_km,
+                    "distance_miles": km_to_miles(distance_km),
                     "calories": activity.get("calories"),
                     "avg_heart_rate": activity.get("averageHR"),
                     "max_heart_rate": activity.get("maxHR"),
@@ -436,7 +457,9 @@ def get_recent_activities(limit: int = 10) -> list:
                 avg_speed = activity.get("averageSpeed")
                 if avg_speed and avg_speed > 0:
                     pace_min_per_km = 1000 / (avg_speed * 60)
+                    pace_min_per_mile = 1609.344 / (avg_speed * 60)
                     act["avg_pace_per_km"] = f"{int(pace_min_per_km)}:{int((pace_min_per_km % 1) * 60):02d}"
+                    act["avg_pace_per_mile"] = f"{int(pace_min_per_mile)}:{int((pace_min_per_mile % 1) * 60):02d}"
 
                 result.append(act)
             return result
@@ -625,7 +648,7 @@ def get_health_data_for_date_range(
     Args:
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
-        metrics: List of metrics to include. Options: steps, sleep, stress, heart_rate, body_battery, hrv
+        metrics: List of metrics to include. Options: steps, sleep, stress, heart_rate, body_battery, hrv, spo2, respiration
     """
     client = get_garmin_client()
 
@@ -653,7 +676,9 @@ def get_health_data_for_date_range(
                 stats = client.get_stats(date_str)
                 if stats:
                     day_data["steps"] = stats.get("totalSteps", 0)
-                    day_data["distance_km"] = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+                    distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+                    day_data["distance_km"] = distance_km
+                    day_data["distance_miles"] = km_to_miles(distance_km)
                     day_data["calories"] = stats.get("totalKilocalories", 0)
             except Exception:
                 pass
@@ -705,6 +730,24 @@ def get_health_data_for_date_range(
                 hrv = client.get_hrv_data(date_str)
                 if hrv:
                     day_data["hrv"] = hrv.get("hrvSummary", {}).get("lastNightAvg")
+            except Exception:
+                pass
+
+        if "spo2" in metrics:
+            try:
+                spo2 = client.get_spo2_data(date_str)
+                if spo2:
+                    day_data["spo2_avg"] = spo2.get("averageSpO2")
+                    day_data["spo2_lowest"] = spo2.get("lowestSpO2")
+            except Exception:
+                pass
+
+        if "respiration" in metrics:
+            try:
+                resp = client.get_respiration_data(date_str)
+                if resp:
+                    day_data["respiration_avg_waking"] = resp.get("avgWakingRespirationValue")
+                    day_data["respiration_avg_sleep"] = resp.get("avgSleepRespirationValue")
             except Exception:
                 pass
 
@@ -873,27 +916,34 @@ def get_activities_by_type(
         for activity in activities:
             act_type = activity.get("activityType", {}).get("typeKey", "").lower()
             if activity_type.lower() in act_type or act_type in activity_type.lower():
+                distance_km = round(activity.get("distance", 0) / 1000, 2)
+                avg_speed = activity.get("averageSpeed", 0)
                 act = {
                     "id": activity.get("activityId"),
                     "name": activity.get("activityName"),
                     "type": activity.get("activityType", {}).get("typeKey"),
                     "date": activity.get("startTimeLocal"),
                     "duration_minutes": round(activity.get("duration", 0) / 60, 1),
-                    "distance_km": round(activity.get("distance", 0) / 1000, 2),
+                    "distance_km": distance_km,
+                    "distance_miles": km_to_miles(distance_km),
                     "calories": activity.get("calories"),
                     "avg_hr": activity.get("averageHR"),
                     "max_hr": activity.get("maxHR"),
-                    "avg_speed_kmh": round(activity.get("averageSpeed", 0) * 3.6, 1) if activity.get("averageSpeed") else None,
+                    "avg_speed_kmh": round(avg_speed * 3.6, 1) if avg_speed else None,
+                    "avg_speed_mph": round(avg_speed * 2.23694, 1) if avg_speed else None,
                 }
 
                 # Add pace for running/walking
-                if activity.get("averageSpeed") and activity.get("averageSpeed") > 0:
-                    pace = 1000 / (activity.get("averageSpeed") * 60)
-                    act["avg_pace_min_km"] = f"{int(pace)}:{int((pace % 1) * 60):02d}"
+                if avg_speed and avg_speed > 0:
+                    pace_km = 1000 / (avg_speed * 60)
+                    pace_mile = 1609.344 / (avg_speed * 60)
+                    act["avg_pace_min_km"] = f"{int(pace_km)}:{int((pace_km % 1) * 60):02d}"
+                    act["avg_pace_min_mile"] = f"{int(pace_mile)}:{int((pace_mile % 1) * 60):02d}"
 
                 # Add elevation if available
                 if activity.get("elevationGain"):
                     act["elevation_gain_m"] = activity.get("elevationGain")
+                    act["elevation_gain_ft"] = round(activity.get("elevationGain") * 3.28084, 0)
 
                 filtered.append(act)
 
@@ -925,6 +975,12 @@ def get_activity_details(activity_id: int) -> dict:
         summary = activity.get("summaryDTO", {})
         act_type = activity.get("activityTypeDTO", {})
 
+        distance_km = round(summary.get("distance", 0) / 1000, 2) if summary.get("distance") else None
+        avg_speed = summary.get("averageSpeed", 0)
+        max_speed = summary.get("maxSpeed", 0)
+        elevation_gain = summary.get("elevationGain")
+        elevation_loss = summary.get("elevationLoss")
+
         result = {
             "id": activity_id,
             "name": activity.get("activityName"),
@@ -932,20 +988,32 @@ def get_activity_details(activity_id: int) -> dict:
             "date": summary.get("startTimeLocal"),
             "duration_seconds": summary.get("duration"),
             "duration_formatted": None,
-            "distance_km": round(summary.get("distance", 0) / 1000, 2) if summary.get("distance") else None,
+            "distance_km": distance_km,
+            "distance_miles": km_to_miles(distance_km) if distance_km else None,
             "calories": summary.get("calories"),
             "avg_hr": summary.get("averageHR"),
             "max_hr": summary.get("maxHR"),
-            "avg_speed_kmh": round(summary.get("averageSpeed", 0) * 3.6, 1) if summary.get("averageSpeed") else None,
-            "max_speed_kmh": round(summary.get("maxSpeed", 0) * 3.6, 1) if summary.get("maxSpeed") else None,
-            "elevation_gain_m": summary.get("elevationGain"),
-            "elevation_loss_m": summary.get("elevationLoss"),
+            "avg_speed_kmh": round(avg_speed * 3.6, 1) if avg_speed else None,
+            "avg_speed_mph": round(avg_speed * 2.23694, 1) if avg_speed else None,
+            "max_speed_kmh": round(max_speed * 3.6, 1) if max_speed else None,
+            "max_speed_mph": round(max_speed * 2.23694, 1) if max_speed else None,
+            "elevation_gain_m": elevation_gain,
+            "elevation_gain_ft": round(elevation_gain * 3.28084, 0) if elevation_gain else None,
+            "elevation_loss_m": elevation_loss,
+            "elevation_loss_ft": round(elevation_loss * 3.28084, 0) if elevation_loss else None,
             "avg_cadence": summary.get("averageRunningCadenceInStepsPerMinute") or summary.get("averageBikingCadenceInRevPerMinute"),
             "avg_power": summary.get("avgPower"),
             "training_effect_aerobic": summary.get("trainingEffect"),
             "training_effect_anaerobic": summary.get("anaerobicTrainingEffect"),
             "vo2_max": summary.get("vO2MaxValue"),
         }
+
+        # Add pace for running/walking activities
+        if avg_speed and avg_speed > 0:
+            pace_km = 1000 / (avg_speed * 60)
+            pace_mile = 1609.344 / (avg_speed * 60)
+            result["avg_pace_min_km"] = f"{int(pace_km)}:{int((pace_km % 1) * 60):02d}"
+            result["avg_pace_min_mile"] = f"{int(pace_mile)}:{int((pace_mile % 1) * 60):02d}"
 
         # Format duration
         if result["duration_seconds"]:
@@ -961,9 +1029,11 @@ def get_activity_details(activity_id: int) -> dict:
             if splits and splits.get("lapDTOs"):
                 result["laps"] = []
                 for i, lap in enumerate(splits.get("lapDTOs", []), 1):
+                    lap_distance_km = round(lap.get("distance", 0) / 1000, 2)
                     result["laps"].append({
                         "lap": i,
-                        "distance_km": round(lap.get("distance", 0) / 1000, 2),
+                        "distance_km": lap_distance_km,
+                        "distance_miles": km_to_miles(lap_distance_km),
                         "duration_seconds": lap.get("duration"),
                         "avg_hr": lap.get("averageHR"),
                         "max_hr": lap.get("maxHR"),
@@ -1066,6 +1136,7 @@ def search_activities(
                 "date": activity.get("startTimeLocal"),
                 "duration_minutes": round(duration_min, 1),
                 "distance_km": round(distance_km, 2),
+                "distance_miles": km_to_miles(distance_km),
                 "calories": activity.get("calories"),
                 "avg_hr": activity.get("averageHR"),
             })
@@ -1132,6 +1203,7 @@ def get_daily_goals_progress(date_str: str = "today") -> dict:
                 "bmr": stats.get("bmrKilocalories", 0),
             },
             "distance_km": round(stats.get("totalDistanceMeters", 0) / 1000, 2),
+            "distance_miles": meters_to_miles(stats.get("totalDistanceMeters", 0)),
         }
     except Exception as e:
         return {"error": str(e)}
