@@ -6,6 +6,8 @@ Exposes Garmin health and fitness data to AI models via Model Context Protocol
 
 import os
 import json
+import logging
+import concurrent.futures
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -13,6 +15,10 @@ from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP, Context
 from garminconnect import Garmin, GarminConnectAuthenticationError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger("garmin_mcp")
 
 # Token storage directory
 TOKEN_DIR = Path.home() / ".garminconnect"
@@ -24,6 +30,9 @@ _garmin_client: Optional[Garmin] = None
 KM_TO_MILES = 0.621371
 METERS_TO_MILES = 0.000621371
 
+# Thread pool for parallel Garmin API calls (synchronous library)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
 
 def km_to_miles(km: float) -> float:
     """Convert kilometers to miles."""
@@ -33,6 +42,40 @@ def km_to_miles(km: float) -> float:
 def meters_to_miles(meters: float) -> float:
     """Convert meters to miles."""
     return round(meters * METERS_TO_MILES, 2)
+
+
+def _parallel_fetch(tasks: list) -> list:
+    """
+    Run a list of (fn, *args) tuples in parallel using the thread pool.
+    Returns results in the same order. None is returned for any task that raises.
+
+    Args:
+        tasks: list of (callable, *positional_args) tuples
+    """
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for task in tasks:
+            fn, *args = task
+            futures.append(pool.submit(fn, *args))
+
+    results = []
+    for f in futures:
+        try:
+            results.append(f.result())
+        except Exception as e:
+            logger.warning(f"Parallel fetch task failed: {e}")
+            results.append(None)
+    return results
+
+
+def _ts_to_readable(ts_ms) -> Optional[str]:
+    """Convert a millisecond timestamp to a human-readable local time string."""
+    if not ts_ms:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
 
 
 def get_garmin_client() -> Garmin:
@@ -84,7 +127,8 @@ mcp = FastMCP(
     instructions="""You have access to the user's Garmin health and fitness data.
     Use these tools to answer questions about their health metrics, activities, sleep, stress, and more.
     Always specify dates in YYYY-MM-DD format. Use 'today' for current date queries.
-    When asked about trends or comparisons, use the date range tools to get multiple days of data."""
+    When asked about trends or comparisons, use the date range tools to get multiple days of data.
+    For a comprehensive weekly health report, use get_weekly_health_report which returns 7 days of data in one call."""
 )
 
 
@@ -112,8 +156,8 @@ def get_todays_summary() -> dict:
             summary["total_calories"] = stats.get("totalKilocalories", 0)
             summary["floors_climbed"] = stats.get("floorsAscended", 0)
             summary["intensity_minutes"] = stats.get("intensityMinutes", 0)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get daily stats for today: {e}")
 
     # Heart rate
     try:
@@ -122,8 +166,8 @@ def get_todays_summary() -> dict:
             summary["resting_heart_rate"] = hr.get("restingHeartRate")
             summary["min_heart_rate"] = hr.get("minHeartRate")
             summary["max_heart_rate"] = hr.get("maxHeartRate")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get heart rate for today: {e}")
 
     # Sleep (from previous night)
     try:
@@ -135,8 +179,8 @@ def get_todays_summary() -> dict:
             summary["sleep_score"] = daily.get("sleepScores", {}).get("overall", {}).get("value")
             summary["deep_sleep_hours"] = round(daily.get("deepSleepSeconds", 0) / 3600, 1)
             summary["rem_sleep_hours"] = round(daily.get("remSleepSeconds", 0) / 3600, 1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get sleep data for today: {e}")
 
     # Stress
     try:
@@ -144,8 +188,8 @@ def get_todays_summary() -> dict:
         if stress:
             summary["stress_avg"] = stress.get("avgStressLevel")
             summary["stress_max"] = stress.get("maxStressLevel")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get stress data for today: {e}")
 
     # Body battery
     try:
@@ -161,8 +205,8 @@ def get_todays_summary() -> dict:
                     summary["body_battery_current"] = levels[-1]
                     summary["body_battery_high"] = max(levels)
                     summary["body_battery_low"] = min(levels)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get body battery for today: {e}")
 
     return summary
 
@@ -245,7 +289,8 @@ def get_heart_rate(date_str: str = "today") -> dict:
 @mcp.tool
 def get_sleep(date_str: str = "today") -> dict:
     """
-    Get sleep data for a specific date including duration, stages, and sleep score.
+    Get sleep data for a specific date including duration, stages, sleep score,
+    avg heart rate, awake count, and sleep stress.
 
     Args:
         date_str: Date in YYYY-MM-DD format, or 'today' for current date
@@ -261,16 +306,25 @@ def get_sleep(date_str: str = "today") -> dict:
             daily = sleep_data.get("dailySleepDTO", {})
             sleep_seconds = daily.get("sleepTimeSeconds", 0)
 
+            # Human-readable start/end times
+            start_ts = daily.get("sleepStartTimestampLocal") or daily.get("sleepStartTimestampGMT")
+            end_ts = daily.get("sleepEndTimestampLocal") or daily.get("sleepEndTimestampGMT")
+
             return {
                 "date": date_str,
-                "sleep_start": daily.get("sleepStartTimestampLocal"),
-                "sleep_end": daily.get("sleepEndTimestampLocal"),
+                "sleep_start_timestamp": start_ts,
+                "sleep_end_timestamp": end_ts,
+                "sleep_start_time": _ts_to_readable(start_ts),
+                "sleep_end_time": _ts_to_readable(end_ts),
                 "total_sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
                 "deep_sleep_hours": round((daily.get("deepSleepSeconds") or 0) / 3600, 2),
                 "light_sleep_hours": round((daily.get("lightSleepSeconds") or 0) / 3600, 2),
                 "rem_sleep_hours": round((daily.get("remSleepSeconds") or 0) / 3600, 2),
                 "awake_hours": round((daily.get("awakeSleepSeconds") or 0) / 3600, 2),
+                "awake_count": daily.get("awakeSleepCount") or daily.get("awakeCount"),
                 "sleep_score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
+                "avg_heart_rate": daily.get("averageHeartRate") or daily.get("avgHeartRate"),
+                "avg_sleep_stress": daily.get("avgSleepStress"),
             }
         return {"date": date_str, "error": "No data available"}
     except Exception as e:
@@ -442,6 +496,7 @@ def get_recent_activities(limit: int = 10) -> list:
             for activity in activities:
                 distance_km = round(activity.get("distance", 0) / 1000, 2)
                 act = {
+                    "id": activity.get("activityId"),
                     "name": activity.get("activityName"),
                     "type": activity.get("activityType", {}).get("typeKey"),
                     "date": activity.get("startTimeLocal"),
@@ -466,6 +521,146 @@ def get_recent_activities(limit: int = 10) -> list:
         return []
     except Exception as e:
         return [{"error": str(e)}]
+
+
+@mcp.tool
+def get_last_activity() -> dict:
+    """
+    Get the most recent activity/workout — quick 'what did I just do' lookup.
+    Returns a single activity with all key metrics.
+    """
+    client = get_garmin_client()
+
+    try:
+        last = client.get_last_activity()
+        if not last:
+            return {"error": "No recent activity found"}
+
+        distance_km = round(last.get("distance", 0) / 1000, 2)
+        avg_speed = last.get("averageSpeed")
+        act = {
+            "id": last.get("activityId"),
+            "name": last.get("activityName"),
+            "type": last.get("activityType", {}).get("typeKey"),
+            "date": last.get("startTimeLocal"),
+            "duration_minutes": round(last.get("duration", 0) / 60, 1),
+            "distance_km": distance_km,
+            "distance_miles": km_to_miles(distance_km),
+            "calories": last.get("calories"),
+            "avg_heart_rate": last.get("averageHR"),
+            "max_heart_rate": last.get("maxHR"),
+            "training_effect_aerobic": last.get("aerobicTrainingEffect"),
+            "training_effect_anaerobic": last.get("anaerobicTrainingEffect"),
+        }
+        if avg_speed and avg_speed > 0:
+            pace_min_per_km = 1000 / (avg_speed * 60)
+            pace_min_per_mile = 1609.344 / (avg_speed * 60)
+            act["avg_pace_per_km"] = f"{int(pace_min_per_km)}:{int((pace_min_per_km % 1) * 60):02d}"
+            act["avg_pace_per_mile"] = f"{int(pace_min_per_mile)}:{int((pace_min_per_mile % 1) * 60):02d}"
+        return act
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool
+def get_activity_exercise_sets(activity_id: int) -> dict:
+    """
+    Get exercise sets, reps, and weight for a strength training activity.
+    This exposes the actual workout data (sets/reps/weight) for lifting sessions.
+
+    Args:
+        activity_id: The activity ID (get from get_recent_activities or get_activities_by_type)
+    """
+    client = get_garmin_client()
+
+    try:
+        raw = client.get_activity_exercise_sets(activity_id)
+        if not raw:
+            return {"activity_id": activity_id, "exercises": [], "error": "No exercise data found"}
+
+        # raw is typically a dict with an "exerciseSets" list
+        exercise_sets = raw.get("exerciseSets", []) if isinstance(raw, dict) else raw
+
+        # Group sets by exercise name/category
+        exercises_map: dict = {}
+        for s in exercise_sets:
+            # Each set has category, exercise info, and the actual set data
+            category = s.get("exerciseCategory") or s.get("category") or "Unknown"
+            exercise_name = (
+                s.get("exercises", [{}])[0].get("exerciseName")
+                if s.get("exercises")
+                else s.get("exerciseName") or category
+            )
+            key = exercise_name or category
+
+            if key not in exercises_map:
+                exercises_map[key] = {
+                    "name": exercise_name or category,
+                    "category": category,
+                    "sets": [],
+                }
+
+            set_num = len(exercises_map[key]["sets"]) + 1
+            reps = s.get("repetitionCount") or s.get("reps")
+            weight_g = s.get("weight")  # garmin stores in grams
+            weight_kg = round(weight_g / 1000, 2) if weight_g else None
+            weight_lb = round(weight_kg * 2.20462, 1) if weight_kg else None
+            duration_sec = s.get("duration") or s.get("durationInSeconds")
+
+            exercises_map[key]["sets"].append({
+                "set_number": set_num,
+                "reps": reps,
+                "weight_kg": weight_kg,
+                "weight_lb": weight_lb,
+                "duration_seconds": duration_sec,
+            })
+
+        return {
+            "activity_id": activity_id,
+            "exercises": list(exercises_map.values()),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get exercise sets for activity {activity_id}: {e}")
+        return {"activity_id": activity_id, "exercises": [], "error": str(e)}
+
+
+@mcp.tool
+def get_body_battery_events(date_str: str = "today") -> dict:
+    """
+    Get body battery events showing what caused energy changes throughout the day
+    (activities, stress events, rest periods).
+
+    Args:
+        date_str: Date in YYYY-MM-DD format, or 'today'
+    """
+    client = get_garmin_client()
+
+    if date_str == "today":
+        date_str = date.today().isoformat()
+
+    try:
+        events = client.get_body_battery_events(date_str)
+        if not events:
+            return {"date": date_str, "events": [], "error": "No body battery event data"}
+
+        # Normalise the event list
+        event_list = events if isinstance(events, list) else events.get("bodyBatteryFeedbackList", [])
+        formatted = []
+        for ev in event_list:
+            formatted.append({
+                "event_type": ev.get("eventType") or ev.get("type"),
+                "start_time": _ts_to_readable(ev.get("startTimestampLocal") or ev.get("startTimestampGMT")),
+                "end_time": _ts_to_readable(ev.get("endTimestampLocal") or ev.get("endTimestampGMT")),
+                "body_battery_change": ev.get("bodyBatteryChange") or ev.get("change"),
+                "body_battery_level": ev.get("bodyBatteryLevel") or ev.get("level"),
+                "feedback_type": ev.get("feedbackType"),
+                "short_feedback": ev.get("shortFeedback"),
+            })
+
+        return {"date": date_str, "events": formatted}
+    except Exception as e:
+        logger.warning(f"Failed to get body battery events for {date_str}: {e}")
+        return {"date": date_str, "events": [], "error": str(e)}
 
 
 @mcp.tool
@@ -548,8 +743,8 @@ def get_body_composition() -> dict:
                     "bone_mass_kg": latest.get("boneMassInGrams", 0) / 1000 if latest.get("boneMassInGrams") else None,
                     "muscle_mass_kg": latest.get("muscleMassInGrams", 0) / 1000 if latest.get("muscleMassInGrams") else None,
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get weigh-ins, falling back to body_composition: {e}")
 
         # Fallback to body composition API
         bc = client.get_body_composition(start, today)
@@ -636,6 +831,93 @@ def get_devices() -> list:
         return [{"error": str(e)}]
 
 
+def _fetch_day_metrics(client: Garmin, date_str: str, metrics: list) -> dict:
+    """Fetch all requested metrics for a single date. Runs synchronously (called from thread pool)."""
+    day_data = {"date": date_str}
+
+    if "steps" in metrics:
+        try:
+            stats = client.get_stats(date_str)
+            if stats:
+                day_data["steps"] = stats.get("totalSteps", 0)
+                distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+                day_data["distance_km"] = distance_km
+                day_data["distance_miles"] = km_to_miles(distance_km)
+                day_data["calories"] = stats.get("totalKilocalories", 0)
+        except Exception as e:
+            logger.warning(f"Failed to get steps for {date_str}: {e}")
+
+    if "heart_rate" in metrics:
+        try:
+            hr = client.get_heart_rates(date_str)
+            if hr:
+                day_data["resting_hr"] = hr.get("restingHeartRate")
+        except Exception as e:
+            logger.warning(f"Failed to get heart rate for {date_str}: {e}")
+
+    if "sleep" in metrics:
+        try:
+            sleep_data = client.get_sleep_data(date_str)
+            if sleep_data:
+                daily = sleep_data.get("dailySleepDTO", {})
+                sleep_sec = daily.get("sleepTimeSeconds", 0)
+                day_data["sleep_hours"] = round(sleep_sec / 3600, 1) if sleep_sec else None
+                day_data["sleep_score"] = daily.get("sleepScores", {}).get("overall", {}).get("value")
+        except Exception as e:
+            logger.warning(f"Failed to get sleep for {date_str}: {e}")
+
+    if "stress" in metrics:
+        try:
+            stress = client.get_stress_data(date_str)
+            if stress:
+                day_data["stress_avg"] = stress.get("avgStressLevel")
+                day_data["stress_max"] = stress.get("maxStressLevel")
+        except Exception as e:
+            logger.warning(f"Failed to get stress for {date_str}: {e}")
+
+    if "body_battery" in metrics:
+        try:
+            bb = client.get_body_battery(date_str)
+            if bb and isinstance(bb, list) and len(bb) > 0:
+                bb_data = bb[0]
+                bb_values = bb_data.get("bodyBatteryValuesArray", [])
+                if bb_values:
+                    levels = [v[1] for v in bb_values if len(v) > 1]
+                    if levels:
+                        day_data["body_battery_high"] = max(levels)
+                        day_data["body_battery_low"] = min(levels)
+        except Exception as e:
+            logger.warning(f"Failed to get body battery for {date_str}: {e}")
+
+    if "hrv" in metrics:
+        try:
+            hrv = client.get_hrv_data(date_str)
+            if hrv:
+                day_data["hrv"] = hrv.get("hrvSummary", {}).get("lastNightAvg")
+        except Exception as e:
+            logger.warning(f"Failed to get HRV for {date_str}: {e}")
+
+    if "spo2" in metrics:
+        try:
+            spo2 = client.get_spo2_data(date_str)
+            if spo2:
+                day_data["spo2_avg"] = spo2.get("averageSpO2")
+                day_data["spo2_lowest"] = spo2.get("lowestSpO2")
+        except Exception as e:
+            logger.warning(f"Failed to get SpO2 for {date_str}: {e}")
+
+    if "respiration" in metrics:
+        try:
+            resp = client.get_respiration_data(date_str)
+            if resp:
+                day_data["respiration_avg_waking"] = resp.get("avgWakingRespirationValue")
+                day_data["respiration_avg_sleep"] = resp.get("avgSleepRespirationValue")
+        except Exception as e:
+            logger.warning(f"Failed to get respiration for {date_str}: {e}")
+
+    return day_data
+
+
 @mcp.tool
 def get_health_data_for_date_range(
     start_date: str,
@@ -644,6 +926,7 @@ def get_health_data_for_date_range(
 ) -> list:
     """
     Get health data for a date range. Useful for analyzing trends.
+    Uses parallel fetching for performance.
 
     Args:
         start_date: Start date in YYYY-MM-DD format
@@ -664,128 +947,59 @@ def get_health_data_for_date_range(
     if (end - start).days > 90:
         return [{"error": "Date range cannot exceed 90 days"}]
 
-    results = []
+    # Build list of dates
+    date_strs = []
     current = start
-
     while current <= end:
-        date_str = current.isoformat()
-        day_data = {"date": date_str}
-
-        if "steps" in metrics:
-            try:
-                stats = client.get_stats(date_str)
-                if stats:
-                    day_data["steps"] = stats.get("totalSteps", 0)
-                    distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
-                    day_data["distance_km"] = distance_km
-                    day_data["distance_miles"] = km_to_miles(distance_km)
-                    day_data["calories"] = stats.get("totalKilocalories", 0)
-            except Exception:
-                pass
-
-        if "heart_rate" in metrics:
-            try:
-                hr = client.get_heart_rates(date_str)
-                if hr:
-                    day_data["resting_hr"] = hr.get("restingHeartRate")
-            except Exception:
-                pass
-
-        if "sleep" in metrics:
-            try:
-                sleep_data = client.get_sleep_data(date_str)
-                if sleep_data:
-                    daily = sleep_data.get("dailySleepDTO", {})
-                    sleep_sec = daily.get("sleepTimeSeconds", 0)
-                    day_data["sleep_hours"] = round(sleep_sec / 3600, 1) if sleep_sec else None
-                    day_data["sleep_score"] = daily.get("sleepScores", {}).get("overall", {}).get("value")
-            except Exception:
-                pass
-
-        if "stress" in metrics:
-            try:
-                stress = client.get_stress_data(date_str)
-                if stress:
-                    day_data["stress_avg"] = stress.get("avgStressLevel")
-                    day_data["stress_max"] = stress.get("maxStressLevel")
-            except Exception:
-                pass
-
-        if "body_battery" in metrics:
-            try:
-                bb = client.get_body_battery(date_str)
-                if bb and isinstance(bb, list) and len(bb) > 0:
-                    bb_data = bb[0]
-                    bb_values = bb_data.get("bodyBatteryValuesArray", [])
-                    if bb_values:
-                        levels = [v[1] for v in bb_values if len(v) > 1]
-                        if levels:
-                            day_data["body_battery_high"] = max(levels)
-                            day_data["body_battery_low"] = min(levels)
-            except Exception:
-                pass
-
-        if "hrv" in metrics:
-            try:
-                hrv = client.get_hrv_data(date_str)
-                if hrv:
-                    day_data["hrv"] = hrv.get("hrvSummary", {}).get("lastNightAvg")
-            except Exception:
-                pass
-
-        if "spo2" in metrics:
-            try:
-                spo2 = client.get_spo2_data(date_str)
-                if spo2:
-                    day_data["spo2_avg"] = spo2.get("averageSpO2")
-                    day_data["spo2_lowest"] = spo2.get("lowestSpO2")
-            except Exception:
-                pass
-
-        if "respiration" in metrics:
-            try:
-                resp = client.get_respiration_data(date_str)
-                if resp:
-                    day_data["respiration_avg_waking"] = resp.get("avgWakingRespirationValue")
-                    day_data["respiration_avg_sleep"] = resp.get("avgSleepRespirationValue")
-            except Exception:
-                pass
-
-        results.append(day_data)
+        date_strs.append(current.isoformat())
         current += timedelta(days=1)
 
-    return results
+    # Fetch all days in parallel
+    tasks = [(_fetch_day_metrics, client, d, metrics) for d in date_strs]
+    results = _parallel_fetch(tasks)
+
+    # Replace None results with placeholder
+    final = []
+    for i, r in enumerate(results):
+        if r is None:
+            final.append({"date": date_strs[i], "error": "fetch failed"})
+        else:
+            final.append(r)
+    return final
 
 
 @mcp.tool
 def get_weekly_summary() -> dict:
     """
     Get a summary of health metrics for the past 7 days with averages and totals.
+    Uses parallel fetching for performance.
     """
     client = get_garmin_client()
     end = date.today()
     start = end - timedelta(days=6)
 
-    data = []
+    date_strs = []
     current = start
-
     while current <= end:
-        date_str = current.isoformat()
-        day = {"date": date_str}
+        date_strs.append(current.isoformat())
+        current += timedelta(days=1)
 
+    def _fetch_summary_day(date_str):
+        day = {"date": date_str}
         try:
             stats = client.get_stats(date_str)
             if stats:
                 day["steps"] = stats.get("totalSteps", 0)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to get stats for {date_str}: {e}")
             day["steps"] = 0
 
         try:
             hr = client.get_heart_rates(date_str)
             if hr:
                 day["resting_hr"] = hr.get("restingHeartRate")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get HR for {date_str}: {e}")
 
         try:
             sleep_data = client.get_sleep_data(date_str)
@@ -793,11 +1007,14 @@ def get_weekly_summary() -> dict:
                 daily = sleep_data.get("dailySleepDTO", {})
                 sleep_sec = daily.get("sleepTimeSeconds", 0)
                 day["sleep_hours"] = round(sleep_sec / 3600, 1) if sleep_sec else None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get sleep for {date_str}: {e}")
 
-        data.append(day)
-        current += timedelta(days=1)
+        return day
+
+    tasks = [(_fetch_summary_day, d) for d in date_strs]
+    raw_results = _parallel_fetch(tasks)
+    data = [r if r is not None else {"date": date_strs[i]} for i, r in enumerate(raw_results)]
 
     # Calculate summary
     steps = [d.get("steps", 0) for d in data]
@@ -1039,8 +1256,8 @@ def get_activity_details(activity_id: int) -> dict:
                         "max_hr": lap.get("maxHR"),
                         "calories": lap.get("calories"),
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get splits for activity {activity_id}: {e}")
 
         # Get HR zones
         try:
@@ -1054,8 +1271,8 @@ def get_activity_details(activity_id: int) -> dict:
                     }
                     for i, z in enumerate(hr_zones, 1)
                 ]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to get HR zones for activity {activity_id}: {e}")
 
         return result
     except Exception as e:
@@ -1243,6 +1460,72 @@ def get_hydration(date_str: str = "today") -> dict:
         return {"date": date_str, "error": str(e)}
 
 
+def _get_period_stats(client: Garmin, start_str: str, end_str: str) -> Optional[dict]:
+    """Fetch aggregated stats for a period using parallel per-day fetches."""
+    try:
+        start = datetime.strptime(start_str, "%Y-%m-%d").date()
+        end = datetime.strptime(end_str, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    date_strs = []
+    current = start
+    while current <= end:
+        date_strs.append(current.isoformat())
+        current += timedelta(days=1)
+
+    def fetch_one(date_str):
+        row = {}
+        try:
+            stats = client.get_stats(date_str)
+            if stats and stats.get("totalSteps"):
+                row["steps"] = stats.get("totalSteps", 0)
+        except Exception as e:
+            logger.warning(f"compare_periods: failed stats for {date_str}: {e}")
+
+        try:
+            hr = client.get_heart_rates(date_str)
+            if hr and hr.get("restingHeartRate"):
+                row["resting_hr"] = hr.get("restingHeartRate")
+        except Exception as e:
+            logger.warning(f"compare_periods: failed HR for {date_str}: {e}")
+
+        try:
+            sleep = client.get_sleep_data(date_str)
+            if sleep:
+                daily = sleep.get("dailySleepDTO", {})
+                if daily.get("sleepTimeSeconds"):
+                    row["sleep_hours"] = daily.get("sleepTimeSeconds") / 3600
+        except Exception as e:
+            logger.warning(f"compare_periods: failed sleep for {date_str}: {e}")
+
+        try:
+            stress = client.get_stress_data(date_str)
+            if stress and stress.get("avgStressLevel"):
+                row["stress"] = stress.get("avgStressLevel")
+        except Exception as e:
+            logger.warning(f"compare_periods: failed stress for {date_str}: {e}")
+
+        return row
+
+    tasks = [(fetch_one, d) for d in date_strs]
+    rows = _parallel_fetch(tasks)
+
+    steps_list = [r["steps"] for r in rows if r and "steps" in r]
+    sleep_list = [r["sleep_hours"] for r in rows if r and "sleep_hours" in r]
+    hr_list = [r["resting_hr"] for r in rows if r and "resting_hr" in r]
+    stress_list = [r["stress"] for r in rows if r and "stress" in r]
+
+    return {
+        "days": (end - start).days + 1,
+        "steps_total": sum(steps_list),
+        "steps_avg": round(sum(steps_list) / len(steps_list)) if steps_list else None,
+        "sleep_avg_hours": round(sum(sleep_list) / len(sleep_list), 1) if sleep_list else None,
+        "resting_hr_avg": round(sum(hr_list) / len(hr_list)) if hr_list else None,
+        "stress_avg": round(sum(stress_list) / len(stress_list)) if stress_list else None,
+    }
+
+
 @mcp.tool
 def compare_periods(
     period1_start: str,
@@ -1252,6 +1535,7 @@ def compare_periods(
 ) -> dict:
     """
     Compare health metrics between two time periods (e.g., this week vs last week).
+    Uses parallel fetching for both periods.
 
     Args:
         period1_start: Start of first period (YYYY-MM-DD)
@@ -1261,70 +1545,17 @@ def compare_periods(
     """
     client = get_garmin_client()
 
-    def get_period_stats(start_str, end_str):
-        try:
-            start = datetime.strptime(start_str, "%Y-%m-%d").date()
-            end = datetime.strptime(end_str, "%Y-%m-%d").date()
-        except ValueError:
-            return None
+    # Fetch both periods concurrently at the period level
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_get_period_stats, client, period1_start, period1_end)
+        f2 = pool.submit(_get_period_stats, client, period2_start, period2_end)
 
-        steps_list = []
-        sleep_list = []
-        hr_list = []
-        stress_list = []
-
-        current = start
-        while current <= end:
-            date_str = current.isoformat()
-
-            try:
-                stats = client.get_stats(date_str)
-                if stats and stats.get("totalSteps"):
-                    steps_list.append(stats.get("totalSteps", 0))
-            except Exception:
-                pass
-
-            try:
-                hr = client.get_heart_rates(date_str)
-                if hr and hr.get("restingHeartRate"):
-                    hr_list.append(hr.get("restingHeartRate"))
-            except Exception:
-                pass
-
-            try:
-                sleep = client.get_sleep_data(date_str)
-                if sleep:
-                    daily = sleep.get("dailySleepDTO", {})
-                    if daily.get("sleepTimeSeconds"):
-                        sleep_list.append(daily.get("sleepTimeSeconds") / 3600)
-            except Exception:
-                pass
-
-            try:
-                stress = client.get_stress_data(date_str)
-                if stress and stress.get("avgStressLevel"):
-                    stress_list.append(stress.get("avgStressLevel"))
-            except Exception:
-                pass
-
-            current += timedelta(days=1)
-
-        return {
-            "days": (end - start).days + 1,
-            "steps_total": sum(steps_list),
-            "steps_avg": round(sum(steps_list) / len(steps_list)) if steps_list else None,
-            "sleep_avg_hours": round(sum(sleep_list) / len(sleep_list), 1) if sleep_list else None,
-            "resting_hr_avg": round(sum(hr_list) / len(hr_list)) if hr_list else None,
-            "stress_avg": round(sum(stress_list) / len(stress_list)) if stress_list else None,
-        }
-
-    period1 = get_period_stats(period1_start, period1_end)
-    period2 = get_period_stats(period2_start, period2_end)
+    period1 = f1.result()
+    period2 = f2.result()
 
     if not period1 or not period2:
         return {"error": "Invalid date format. Use YYYY-MM-DD"}
 
-    # Calculate differences
     def diff(a, b):
         if a is None or b is None:
             return None
@@ -1336,14 +1567,8 @@ def compare_periods(
         return round((a - b) / b * 100, 1)
 
     return {
-        "period1": {
-            "range": f"{period1_start} to {period1_end}",
-            **period1
-        },
-        "period2": {
-            "range": f"{period2_start} to {period2_end}",
-            **period2
-        },
+        "period1": {"range": f"{period1_start} to {period1_end}", **period1},
+        "period2": {"range": f"{period2_start} to {period2_end}", **period2},
         "comparison": {
             "steps_total_diff": diff(period1["steps_total"], period2["steps_total"]),
             "steps_avg_diff": diff(period1["steps_avg"], period2["steps_avg"]),
@@ -1469,7 +1694,7 @@ def get_all_day_stress(date_str: str = "today") -> dict:
             }
         return {"date": date_str, "error": "No stress data available"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"date": date_str, "error": str(e)}
 
 
 @mcp.tool
@@ -1483,32 +1708,32 @@ def get_sleep_quality_trends(days: int = 7) -> dict:
     client = get_garmin_client()
     days = min(max(1, days), 30)
 
-    results = []
-    current = date.today()
+    date_strs = [(date.today() - timedelta(days=i)).isoformat() for i in range(days)]
 
-    for _ in range(days):
-        date_str = current.isoformat()
-
+    def fetch_sleep(date_str):
         try:
             sleep = client.get_sleep_data(date_str)
             if sleep:
                 daily = sleep.get("dailySleepDTO", {})
                 if daily.get("sleepTimeSeconds"):
-                    results.append({
+                    return {
                         "date": date_str,
                         "sleep_hours": round(daily.get("sleepTimeSeconds", 0) / 3600, 1),
                         "deep_pct": round(daily.get("deepSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
                         "rem_pct": round(daily.get("remSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
                         "light_pct": round(daily.get("lightSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
-                        "awake_count": daily.get("awakeCount"),
+                        "awake_count": daily.get("awakeSleepCount") or daily.get("awakeCount"),
                         "sleep_score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
-                        "avg_hr": daily.get("avgHeartRate"),
+                        "avg_hr": daily.get("averageHeartRate") or daily.get("avgHeartRate"),
                         "avg_stress": daily.get("avgSleepStress"),
-                    })
-        except Exception:
-            pass
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to get sleep quality for {date_str}: {e}")
+        return None
 
-        current -= timedelta(days=1)
+    tasks = [(fetch_sleep, d) for d in date_strs]
+    raw = _parallel_fetch(tasks)
+    results = [r for r in raw if r is not None]
 
     if not results:
         return {"error": "No sleep data available"}
@@ -1553,8 +1778,8 @@ def get_recovery_metrics() -> dict:
                 "level": readiness.get("level"),
                 "recovery_time_hours": readiness.get("recoveryTime"),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get training readiness: {e}")
 
     # HRV
     try:
@@ -1569,8 +1794,8 @@ def get_recovery_metrics() -> dict:
                 "baseline_balanced_low": summary.get("baseline", {}).get("balancedLow"),
                 "baseline_balanced_high": summary.get("baseline", {}).get("balancedUpper"),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get HRV data: {e}")
 
     # Sleep
     try:
@@ -1582,8 +1807,8 @@ def get_recovery_metrics() -> dict:
                 "score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
                 "deep_pct": round(daily.get("deepSleepSeconds", 0) / max(daily.get("sleepTimeSeconds", 1), 1) * 100, 1),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get sleep data for recovery: {e}")
 
     # Body battery
     try:
@@ -1599,8 +1824,8 @@ def get_recovery_metrics() -> dict:
                         "morning_high": max(levels),
                         "charged_overnight": bb_data.get("charged"),
                     }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get body battery for recovery: {e}")
 
     # Stress
     try:
@@ -1609,8 +1834,8 @@ def get_recovery_metrics() -> dict:
             result["stress"] = {
                 "avg_level": stress.get("avgStressLevel"),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get stress data for recovery: {e}")
 
     # Resting HR
     try:
@@ -1618,19 +1843,18 @@ def get_recovery_metrics() -> dict:
         if hr:
             result["resting_heart_rate"] = hr.get("restingHeartRate")
             result["resting_hr_7day_avg"] = hr.get("lastSevenDaysAvgRestingHeartRate")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get heart rate for recovery: {e}")
 
     # Overall recommendation
     score = result.get("training_readiness", {}).get("score", 0) or 0
-    bb = result.get("body_battery", {}).get("current", 0) or 0
-    hrv_status = result.get("hrv", {}).get("status", "")
+    bb_level = result.get("body_battery", {}).get("current", 0) or 0
 
-    if score >= 70 and bb >= 50:
+    if score >= 70 and bb_level >= 50:
         result["recommendation"] = "Ready for high intensity training"
-    elif score >= 50 and bb >= 30:
+    elif score >= 50 and bb_level >= 30:
         result["recommendation"] = "Moderate training recommended"
-    elif score >= 30 or bb >= 20:
+    elif score >= 30 or bb_level >= 20:
         result["recommendation"] = "Light activity or recovery day recommended"
     else:
         result["recommendation"] = "Rest day recommended"
@@ -1670,7 +1894,8 @@ def get_step_streak() -> dict:
                         best_streak = max(best_streak, streak_count if current_streak_active else 1)
                     else:
                         current_streak_active = False
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to get step streak stats for {date_str}: {e}")
                 current_streak_active = False
 
             current -= timedelta(days=1)
@@ -1683,6 +1908,424 @@ def get_step_streak() -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# =============================================================================
+# COMPREHENSIVE WEEKLY HEALTH REPORT
+# =============================================================================
+
+def _fetch_full_day(client: Garmin, date_str: str) -> dict:
+    """
+    Fetch ALL health metrics for a single date in parallel sub-tasks.
+    Returns a rich dict with sleep, HRV, stress, body battery, steps, HR.
+    """
+    def get_sleep():
+        try:
+            data = client.get_sleep_data(date_str)
+            if data:
+                daily = data.get("dailySleepDTO", {})
+                sleep_sec = daily.get("sleepTimeSeconds", 0)
+                start_ts = daily.get("sleepStartTimestampLocal") or daily.get("sleepStartTimestampGMT")
+                end_ts = daily.get("sleepEndTimestampLocal") or daily.get("sleepEndTimestampGMT")
+                return {
+                    "total_hours": round(sleep_sec / 3600, 2) if sleep_sec else None,
+                    "deep_hours": round((daily.get("deepSleepSeconds") or 0) / 3600, 2),
+                    "light_hours": round((daily.get("lightSleepSeconds") or 0) / 3600, 2),
+                    "rem_hours": round((daily.get("remSleepSeconds") or 0) / 3600, 2),
+                    "awake_hours": round((daily.get("awakeSleepSeconds") or 0) / 3600, 2),
+                    "awake_count": daily.get("awakeSleepCount") or daily.get("awakeCount"),
+                    "score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
+                    "avg_heart_rate": daily.get("averageHeartRate") or daily.get("avgHeartRate"),
+                    "avg_sleep_stress": daily.get("avgSleepStress"),
+                    "start_time": _ts_to_readable(start_ts),
+                    "end_time": _ts_to_readable(end_ts),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: sleep failed for {date_str}: {e}")
+        return {}
+
+    def get_hrv():
+        try:
+            data = client.get_hrv_data(date_str)
+            if data:
+                s = data.get("hrvSummary", {})
+                return {
+                    "nightly_avg": s.get("lastNightAvg"),
+                    "weekly_avg": s.get("weeklyAvg"),
+                    "status": s.get("status"),
+                    "feedback": s.get("feedbackPhrase"),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: HRV failed for {date_str}: {e}")
+        return {}
+
+    def get_stress():
+        try:
+            data = client.get_stress_data(date_str)
+            if data:
+                return {
+                    "avg": data.get("avgStressLevel"),
+                    "max": data.get("maxStressLevel"),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: stress failed for {date_str}: {e}")
+        return {}
+
+    def get_bb():
+        try:
+            bb = client.get_body_battery(date_str)
+            if bb and isinstance(bb, list) and len(bb) > 0:
+                bb_data = bb[0]
+                bb_values = bb_data.get("bodyBatteryValuesArray", [])
+                levels = [v[1] for v in bb_values if len(v) > 1] if bb_values else []
+                return {
+                    "charged": bb_data.get("charged"),
+                    "drained": bb_data.get("drained"),
+                    "high": max(levels) if levels else None,
+                    "low": min(levels) if levels else None,
+                    "end_of_day": levels[-1] if levels else None,
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: body battery failed for {date_str}: {e}")
+        return {}
+
+    def get_hr():
+        try:
+            data = client.get_heart_rates(date_str)
+            if data:
+                return {"resting": data.get("restingHeartRate")}
+        except Exception as e:
+            logger.warning(f"weekly report: HR failed for {date_str}: {e}")
+        return {}
+
+    def get_steps():
+        try:
+            data = client.get_stats(date_str)
+            if data:
+                return {
+                    "count": data.get("totalSteps", 0),
+                    "goal": data.get("dailyStepGoal", 0),
+                    "calories": data.get("totalKilocalories", 0),
+                    "active_calories": data.get("activeKilocalories", 0),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: steps failed for {date_str}: {e}")
+        return {}
+
+    # Run all sub-fetches in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        f_sleep = pool.submit(get_sleep)
+        f_hrv = pool.submit(get_hrv)
+        f_stress = pool.submit(get_stress)
+        f_bb = pool.submit(get_bb)
+        f_hr = pool.submit(get_hr)
+        f_steps = pool.submit(get_steps)
+
+    return {
+        "date": date_str,
+        "sleep": f_sleep.result(),
+        "hrv": f_hrv.result(),
+        "stress": f_stress.result(),
+        "body_battery": f_bb.result(),
+        "heart_rate": f_hr.result(),
+        "steps": f_steps.result(),
+    }
+
+
+def _compute_week_over_week(current_days: list, prior_days: list) -> dict:
+    """Compute week-over-week differences and percent changes for key metrics."""
+    def avg(days, path):
+        vals = []
+        for d in days:
+            try:
+                v = d
+                for key in path:
+                    v = v.get(key) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                if v is not None:
+                    vals.append(float(v))
+            except Exception:
+                pass
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    def total(days, path):
+        vals = []
+        for d in days:
+            try:
+                v = d
+                for key in path:
+                    v = v.get(key) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                if v is not None:
+                    vals.append(float(v))
+            except Exception:
+                pass
+        return round(sum(vals), 1) if vals else None
+
+    def diff_pct(cur, pri):
+        if cur is None or pri is None or pri == 0:
+            return None
+        return round((cur - pri) / abs(pri) * 100, 1)
+
+    metrics = {
+        "steps_total": (total(current_days, ["steps", "count"]), total(prior_days, ["steps", "count"])),
+        "sleep_avg_hours": (avg(current_days, ["sleep", "total_hours"]), avg(prior_days, ["sleep", "total_hours"])),
+        "sleep_score_avg": (avg(current_days, ["sleep", "score"]), avg(prior_days, ["sleep", "score"])),
+        "hrv_avg": (avg(current_days, ["hrv", "nightly_avg"]), avg(prior_days, ["hrv", "nightly_avg"])),
+        "stress_avg": (avg(current_days, ["stress", "avg"]), avg(prior_days, ["stress", "avg"])),
+        "resting_hr_avg": (avg(current_days, ["heart_rate", "resting"]), avg(prior_days, ["heart_rate", "resting"])),
+        "body_battery_high_avg": (avg(current_days, ["body_battery", "high"]), avg(prior_days, ["body_battery", "high"])),
+    }
+
+    result = {}
+    for metric, (cur, pri) in metrics.items():
+        result[metric] = {
+            "current_week": cur,
+            "prior_week": pri,
+            "diff": round(cur - pri, 2) if cur is not None and pri is not None else None,
+            "pct_change": diff_pct(cur, pri),
+        }
+    return result
+
+
+@mcp.tool
+def get_weekly_health_report(end_date: str = "today") -> dict:
+    """
+    Comprehensive weekly health report — returns 7 days of all key metrics in ONE call.
+    Replaces 80+ sequential API calls by fetching everything in parallel.
+
+    Includes:
+    - 7 days of sleep (stages, score, avg HR, awake count, times)
+    - 7 days of HRV (nightly avg + status)
+    - 7 days of stress (avg/max)
+    - 7 days of body battery (high/low/charged/drained)
+    - 7 days of resting HR and steps
+    - Week-over-week comparison vs prior 7 days
+    - Weight/body composition history (last 30 days)
+    - Recent strength training activities (last 10) with exercise sets
+    - Current training readiness + training status
+    - Sleep quality trends
+    - Current recovery metrics
+
+    Args:
+        end_date: Last date of the report period (YYYY-MM-DD or 'today')
+    """
+    client = get_garmin_client()
+
+    if end_date == "today":
+        end_dt = date.today()
+    else:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"error": "Invalid date format. Use YYYY-MM-DD or 'today'"}
+
+    # Build date lists
+    current_week_dates = [(end_dt - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+    prior_week_dates = [(end_dt - timedelta(days=i)).isoformat() for i in range(13, 6, -1)]
+
+    logger.info(f"Weekly health report: fetching {len(current_week_dates) + len(prior_week_dates)} day-sets in parallel")
+
+    # ── Fetch per-day data for both weeks in parallel ──────────────────────────
+    all_dates = current_week_dates + prior_week_dates
+    tasks = [(_fetch_full_day, client, d) for d in all_dates]
+    all_day_results = _parallel_fetch(tasks)
+
+    current_days = all_day_results[:7]
+    prior_days = all_day_results[7:]
+
+    # Replace any None results with placeholder dicts
+    current_days = [r if r else {"date": current_week_dates[i]} for i, r in enumerate(current_days)]
+    prior_days = [r if r else {"date": prior_week_dates[i]} for i, r in enumerate(prior_days)]
+
+    # ── Fetch supporting data in parallel (weight, activities, readiness, etc.) ──
+    def fetch_weight():
+        try:
+            end_str = end_dt.isoformat()
+            start_str = (end_dt - timedelta(days=30)).isoformat()
+            bc = client.get_body_composition(start_str, end_str)
+            if bc:
+                weights = bc.get("dateWeightList", [])
+                return [
+                    {
+                        "date": w.get("calendarDate"),
+                        "weight_kg": round(w.get("weight", 0) / 1000, 2),
+                        "weight_lb": round(w.get("weight", 0) / 1000 * 2.20462, 1),
+                        "body_fat_pct": w.get("bodyFat"),
+                        "muscle_mass_kg": round(w.get("muscleMass", 0) / 1000, 2) if w.get("muscleMass") else None,
+                    }
+                    for w in weights if w.get("weight")
+                ]
+        except Exception as e:
+            logger.warning(f"weekly report: weight history failed: {e}")
+        return []
+
+    def fetch_strength_activities():
+        try:
+            activities = client.get_activities(0, 40)
+            if not activities:
+                return []
+            strength = [
+                a for a in activities
+                if "strength" in (a.get("activityType", {}).get("typeKey") or "").lower()
+            ][:10]
+
+            result = []
+            for act in strength:
+                act_id = act.get("activityId")
+                sets_data = {}
+                if act_id:
+                    try:
+                        sets_data = client.get_activity_exercise_sets(act_id) or {}
+                        # Parse sets into clean format
+                        raw_sets = sets_data.get("exerciseSets", []) if isinstance(sets_data, dict) else []
+                        exercises_map: dict = {}
+                        for s in raw_sets:
+                            category = s.get("exerciseCategory") or s.get("category") or "Unknown"
+                            exercise_name = (
+                                s.get("exercises", [{}])[0].get("exerciseName")
+                                if s.get("exercises")
+                                else s.get("exerciseName") or category
+                            )
+                            key = exercise_name or category
+                            if key not in exercises_map:
+                                exercises_map[key] = {"name": exercise_name or category, "category": category, "sets": []}
+                            set_num = len(exercises_map[key]["sets"]) + 1
+                            reps = s.get("repetitionCount") or s.get("reps")
+                            weight_g = s.get("weight")
+                            weight_kg = round(weight_g / 1000, 2) if weight_g else None
+                            exercises_map[key]["sets"].append({
+                                "set_number": set_num,
+                                "reps": reps,
+                                "weight_kg": weight_kg,
+                                "weight_lb": round(weight_kg * 2.20462, 1) if weight_kg else None,
+                                "duration_seconds": s.get("duration") or s.get("durationInSeconds"),
+                            })
+                        sets_data = {"exercises": list(exercises_map.values())}
+                    except Exception as e:
+                        logger.warning(f"weekly report: exercise sets failed for {act_id}: {e}")
+                        sets_data = {}
+
+                result.append({
+                    "id": act_id,
+                    "name": act.get("activityName"),
+                    "date": act.get("startTimeLocal"),
+                    "duration_minutes": round(act.get("duration", 0) / 60, 1),
+                    "calories": act.get("calories"),
+                    "avg_hr": act.get("averageHR"),
+                    "exercises": sets_data.get("exercises", []),
+                })
+            return result
+        except Exception as e:
+            logger.warning(f"weekly report: strength activities failed: {e}")
+        return []
+
+    def fetch_training_readiness():
+        try:
+            today_str = end_dt.isoformat()
+            readiness_list = client.get_training_readiness(today_str)
+            if readiness_list and isinstance(readiness_list, list) and len(readiness_list) > 0:
+                r = readiness_list[0]
+                return {
+                    "score": r.get("score"),
+                    "level": r.get("level"),
+                    "feedback": r.get("feedbackShort"),
+                    "recovery_time_hours": r.get("recoveryTime"),
+                    "sleep_score": r.get("sleepScore"),
+                    "hrv_feedback": r.get("hrvFactorFeedback"),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: training readiness failed: {e}")
+        return {}
+
+    def fetch_training_status():
+        try:
+            today_str = end_dt.isoformat()
+            status = client.get_training_status(today_str)
+            if status:
+                vo2_obj = status.get("mostRecentVO2Max", {}) or {}
+                ts_obj = status.get("mostRecentTrainingStatus", {}) or {}
+                lb_obj = status.get("mostRecentTrainingLoadBalance", {}) or {}
+                return {
+                    "training_status": ts_obj.get("trainingStatusLabel") or ts_obj.get("trainingStatusKey"),
+                    "vo2_max": vo2_obj.get("vo2MaxValue") or vo2_obj.get("vo2Max"),
+                    "weekly_load": lb_obj.get("weeklyLoadTotal"),
+                    "acute_load": lb_obj.get("acuteLoad"),
+                    "chronic_load": lb_obj.get("chronicLoad"),
+                }
+        except Exception as e:
+            logger.warning(f"weekly report: training status failed: {e}")
+        return {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        f_weight = pool.submit(fetch_weight)
+        f_strength = pool.submit(fetch_strength_activities)
+        f_readiness = pool.submit(fetch_training_readiness)
+        f_status = pool.submit(fetch_training_status)
+
+    weight_history = f_weight.result()
+    strength_activities = f_strength.result()
+    training_readiness = f_readiness.result()
+    training_status = f_status.result()
+
+    # ── Week-over-week comparison ──────────────────────────────────────────────
+    wow = _compute_week_over_week(current_days, prior_days)
+
+    # ── Sleep quality trends (just the 7 current days) ────────────────────────
+    sleep_trends = []
+    for d in current_days:
+        s = d.get("sleep", {})
+        if s.get("total_hours"):
+            total_sec = s["total_hours"] * 3600
+            sleep_trends.append({
+                "date": d["date"],
+                "total_hours": s.get("total_hours"),
+                "score": s.get("score"),
+                "deep_pct": round(s.get("deep_hours", 0) / s["total_hours"] * 100, 1) if s.get("total_hours") else None,
+                "rem_pct": round(s.get("rem_hours", 0) / s["total_hours"] * 100, 1) if s.get("total_hours") else None,
+                "awake_count": s.get("awake_count"),
+                "avg_hr": s.get("avg_heart_rate"),
+                "avg_stress": s.get("avg_sleep_stress"),
+            })
+
+    # ── Current recovery snapshot (last day in current week) ──────────────────
+    last_day = current_days[-1]
+    bb_today = last_day.get("body_battery", {})
+    hrv_today = last_day.get("hrv", {})
+    sleep_today = last_day.get("sleep", {})
+    readiness_score = training_readiness.get("score") or 0
+    bb_current = bb_today.get("end_of_day") or bb_today.get("high") or 0
+    recovery_status = (
+        "Ready for high intensity" if readiness_score >= 70 and bb_current >= 50
+        else "Moderate training OK" if readiness_score >= 50 and bb_current >= 30
+        else "Light activity/recovery day" if readiness_score >= 30 or bb_current >= 20
+        else "Rest day recommended"
+    )
+
+    return {
+        "report_period": {
+            "start": current_week_dates[0],
+            "end": current_week_dates[-1],
+        },
+        "daily_data": current_days,
+        "week_over_week": wow,
+        "sleep_quality_trends": sleep_trends,
+        "weight_history_30d": weight_history,
+        "strength_activities": strength_activities,
+        "training_readiness": training_readiness,
+        "training_status": training_status,
+        "recovery_snapshot": {
+            "date": last_day.get("date"),
+            "body_battery_current": bb_current,
+            "hrv_last_night": hrv_today.get("nightly_avg"),
+            "hrv_status": hrv_today.get("status"),
+            "sleep_score": sleep_today.get("score"),
+            "readiness_score": readiness_score,
+            "recommendation": recovery_status,
+        },
+    }
 
 
 if __name__ == "__main__":
