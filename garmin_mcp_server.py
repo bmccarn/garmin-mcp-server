@@ -31,7 +31,7 @@ KM_TO_MILES = 0.621371
 METERS_TO_MILES = 0.000621371
 
 # Thread pool for parallel Garmin API calls (synchronous library)
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 
 def km_to_miles(km: float) -> float:
@@ -53,7 +53,7 @@ def _parallel_fetch(tasks: list) -> list:
         tasks: list of (callable, *positional_args) tuples
     """
     futures = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         for task in tasks:
             fn, *args = task
             futures.append(pool.submit(fn, *args))
@@ -647,14 +647,40 @@ def get_body_battery_events(date_str: str = "today") -> dict:
         event_list = events if isinstance(events, list) else events.get("bodyBatteryFeedbackList", [])
         formatted = []
         for ev in event_list:
+            # Garmin nests event metadata under an "event" key
+            inner = ev.get("event", {}) if isinstance(ev.get("event"), dict) else ev
+            # Calculate end time from start + duration
+            start_gmt = inner.get("eventStartTimeGmt")
+            duration_ms = inner.get("durationInMilliseconds", 0)
+            tz_offset_ms = inner.get("timezoneOffset", 0)
+
+            # Parse start time
+            start_local = None
+            end_local = None
+            if start_gmt:
+                try:
+                    from datetime import datetime as dt_cls
+                    start_dt = dt_cls.strptime(start_gmt.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+                    # Apply timezone offset (negative = behind UTC)
+                    start_dt = start_dt + timedelta(milliseconds=tz_offset_ms)
+                    start_local = start_dt.strftime("%Y-%m-%d %H:%M")
+                    if duration_ms:
+                        end_dt = start_dt + timedelta(milliseconds=duration_ms)
+                        end_local = end_dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pass
+
             formatted.append({
-                "event_type": ev.get("eventType") or ev.get("type"),
-                "start_time": _ts_to_readable(ev.get("startTimestampLocal") or ev.get("startTimestampGMT")),
-                "end_time": _ts_to_readable(ev.get("endTimestampLocal") or ev.get("endTimestampGMT")),
-                "body_battery_change": ev.get("bodyBatteryChange") or ev.get("change"),
-                "body_battery_level": ev.get("bodyBatteryLevel") or ev.get("level"),
-                "feedback_type": ev.get("feedbackType"),
-                "short_feedback": ev.get("shortFeedback"),
+                "event_type": inner.get("eventType"),
+                "start_time": start_local,
+                "end_time": end_local,
+                "duration_minutes": round(duration_ms / 60000, 1) if duration_ms else None,
+                "body_battery_impact": inner.get("bodyBatteryImpact"),
+                "feedback_type": inner.get("feedbackType"),
+                "short_feedback": inner.get("shortFeedback"),
+                "activity_name": ev.get("activityName"),
+                "activity_type": ev.get("activityType"),
+                "avg_stress": round(ev.get("averageStress", 0), 1) if ev.get("averageStress") else None,
             })
 
         return {"date": date_str, "events": formatted}
