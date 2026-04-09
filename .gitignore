@@ -2,22 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
+dist/
+build/
 *.egg
 
 # Virtual environments
@@ -25,31 +12,19 @@ wheels/
 .venv
 env/
 venv/
-ENV/
 
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
-*~
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Project specific
-*.json
-*.csv
-!package.json
-!package-lock.json
-
-# Credentials and tokens (NEVER commit these)
+# Credentials (NEVER commit)
 .garminconnect/
 credentials.json
 secrets.json
@@ -58,9 +33,3 @@ secrets.json
 
 # Logs
 *.log
-logs/
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/

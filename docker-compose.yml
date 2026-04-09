@@ -2,11 +2,6 @@ services:
   garmin-mcp:
     build: .
     container_name: garmin-mcp-server
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-      - "kuma.garmin-mcp.port.name=Garmin MCP"
-      - "kuma.garmin-mcp.port.hostname=10.10.10.10"
-      - "kuma.garmin-mcp.port.port=8000"
     ports:
       - "8000:8000"
     volumes:
@@ -14,16 +9,9 @@ services:
     restart: unless-stopped
     environment:
       - TZ=America/New_York
-    networks:
-      - default
-      - litellm_litellm_net
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost',8000)); s.close()\""]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-
-networks:
-  litellm_litellm_net:
-    external: true
