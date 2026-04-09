@@ -1,2 +1,2 @@
 fastmcp>=2.0.0
-garminconnect>=0.2.20
+garminconnect>=0.2.20,<0.3

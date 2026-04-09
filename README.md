@@ -18,8 +18,11 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that e
 
 ```bash
 # 1. Authenticate with Garmin (one-time)
-pip install garminconnect
+pip install 'garminconnect>=0.2.20,<0.3'
 python garmin_auth.py
+# If you hit a 429 from Cloudflare, use the browser-assisted fallback instead:
+#   python garmin_browser_auth.py
+# (see "Browser-assisted login" under Authentication below)
 
 # 2. Build and run
 docker compose up -d
@@ -62,6 +65,24 @@ You can also set environment variables for non-interactive auth:
 export GARMIN_EMAIL="your@email.com"
 export GARMIN_PASSWORD="your-password"
 ```
+
+> **Note on `garminconnect` version:** `requirements.txt` pins to `<0.3`. The 0.3.x release rewrote the login flow with new strategies that Cloudflare currently 429s, and it also removed the `client.garth` attribute this repo relies on. Stay on `0.2.x` until the upstream situation settles.
+
+### Browser-assisted login (Cloudflare fallback)
+
+If `garmin_auth.py` fails with `429 Too Many Requests` from `sso.garmin.com`, Garmin's Cloudflare is blocking the scripted login POST from your IP. Use the browser-assisted fallback instead:
+
+```bash
+python garmin_browser_auth.py
+```
+
+This script:
+1. Opens Garmin's SSO sign-in page in your real browser (which Cloudflare allows)
+2. You sign in normally — MFA works natively because the browser handles it
+3. You paste the post-login `ticket=ST-...` value back into the script
+4. The script exchanges the ticket for OAuth1/OAuth2 tokens via `connectapi.garmin.com` (a different host that isn't Cloudflare-walled) and writes the same `~/.garminconnect/oauth1_token.json` and `oauth2_token.json` files that `garmin_auth.py` produces
+
+No other code needs to change — `garmin_mcp_server.py` loads the resulting tokens the same way. The most reliable way to grab the ticket is to open Chrome DevTools → Network tab → enable "Preserve log" **before** clicking Sign In, then inspect the response body of the `POST /sso/signin` request and copy the `ST-...` value.
 
 ## Available Tools (34)
 
@@ -185,13 +206,14 @@ Once connected, ask your AI things like:
 ## Project Structure
 
 ```
-├── garmin_mcp_server.py   # MCP server (34 tools)
-├── garmin_auth.py         # One-time Garmin authentication
-├── run_mcp_server.sh      # Server launch script
-├── Dockerfile             # Container build
-├── docker-compose.yml     # Docker Compose config
-├── requirements.txt       # Python dependencies
-└── LICENSE                # MIT
+├── garmin_mcp_server.py     # MCP server (34 tools)
+├── garmin_auth.py           # One-time Garmin authentication
+├── garmin_browser_auth.py   # Browser-assisted auth fallback (Cloudflare 429 workaround)
+├── run_mcp_server.sh        # Server launch script
+├── Dockerfile               # Container build
+├── docker-compose.yml       # Docker Compose config
+├── requirements.txt         # Python dependencies
+└── LICENSE                  # MIT
 ```
 
 ## Environment Variables
@@ -205,6 +227,10 @@ Once connected, ask your AI things like:
 ## Troubleshooting
 
 **Authentication failed:** Run `python garmin_auth.py` to re-authenticate. Tokens may have expired.
+
+**`429 Too Many Requests` on login:** Garmin's Cloudflare is rate-limiting the scripted login POST to `sso.garmin.com/sso/signin`. Use `python garmin_browser_auth.py` instead (see the [Browser-assisted login](#browser-assisted-login-cloudflare-fallback) section) — it signs you in via your real browser and then exchanges the SSO ticket against `connectapi.garmin.com`, which isn't blocked the same way. Also make sure you're on `garminconnect<0.3` — the 0.3.x rewrite hits the same wall with every strategy it tries.
+
+**`AttributeError: 'Garmin' object has no attribute 'garth'`:** You're on `garminconnect>=0.3.0`, which dropped the `garth` attribute this repo uses. Downgrade with `pip install 'garminconnect>=0.2.20,<0.3'`.
 
 **Empty data for some metrics:** Your Garmin device may not track that metric, or data hasn't synced yet.
 
