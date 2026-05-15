@@ -149,7 +149,7 @@ def get_todays_summary() -> dict:
         if stats:
             summary["steps"] = stats.get("totalSteps", 0)
             summary["step_goal"] = stats.get("dailyStepGoal", 0)
-            distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+            distance_km = round((stats.get("totalDistanceMeters") or 0) / 1000, 2)
             summary["distance_km"] = distance_km
             summary["distance_miles"] = km_to_miles(distance_km)
             summary["active_calories"] = stats.get("activeKilocalories", 0)
@@ -174,11 +174,11 @@ def get_todays_summary() -> dict:
         sleep_data = client.get_sleep_data(today)
         if sleep_data:
             daily = sleep_data.get("dailySleepDTO", {})
-            sleep_seconds = daily.get("sleepTimeSeconds", 0)
+            sleep_seconds = daily.get("sleepTimeSeconds") or 0
             summary["sleep_hours"] = round(sleep_seconds / 3600, 1) if sleep_seconds else None
             summary["sleep_score"] = daily.get("sleepScores", {}).get("overall", {}).get("value")
-            summary["deep_sleep_hours"] = round(daily.get("deepSleepSeconds", 0) / 3600, 1)
-            summary["rem_sleep_hours"] = round(daily.get("remSleepSeconds", 0) / 3600, 1)
+            summary["deep_sleep_hours"] = round((daily.get("deepSleepSeconds") or 0) / 3600, 1)
+            summary["rem_sleep_hours"] = round((daily.get("remSleepSeconds") or 0) / 3600, 1)
     except Exception as e:
         logger.warning(f"Failed to get sleep data for today: {e}")
 
@@ -227,7 +227,7 @@ def get_daily_stats(date_str: str = "today") -> dict:
     try:
         stats = client.get_stats(date_str)
         if stats:
-            distance_meters = stats.get("totalDistanceMeters", 0)
+            distance_meters = (stats.get("totalDistanceMeters") or 0)
             distance_km = round(distance_meters / 1000, 2)
             return {
                 "date": date_str,
@@ -304,7 +304,7 @@ def get_sleep(date_str: str = "today") -> dict:
         sleep_data = client.get_sleep_data(date_str)
         if sleep_data:
             daily = sleep_data.get("dailySleepDTO", {})
-            sleep_seconds = daily.get("sleepTimeSeconds", 0)
+            sleep_seconds = daily.get("sleepTimeSeconds") or 0
 
             # Human-readable start/end times
             start_ts = daily.get("sleepStartTimestampLocal") or daily.get("sleepStartTimestampGMT")
@@ -866,7 +866,7 @@ def _fetch_day_metrics(client: Garmin, date_str: str, metrics: list) -> dict:
             stats = client.get_stats(date_str)
             if stats:
                 day_data["steps"] = stats.get("totalSteps", 0)
-                distance_km = round(stats.get("totalDistanceMeters", 0) / 1000, 2)
+                distance_km = round((stats.get("totalDistanceMeters") or 0) / 1000, 2)
                 day_data["distance_km"] = distance_km
                 day_data["distance_miles"] = km_to_miles(distance_km)
                 day_data["calories"] = stats.get("totalKilocalories", 0)
@@ -886,7 +886,7 @@ def _fetch_day_metrics(client: Garmin, date_str: str, metrics: list) -> dict:
             sleep_data = client.get_sleep_data(date_str)
             if sleep_data:
                 daily = sleep_data.get("dailySleepDTO", {})
-                sleep_sec = daily.get("sleepTimeSeconds", 0)
+                sleep_sec = daily.get("sleepTimeSeconds") or 0
                 day_data["sleep_hours"] = round(sleep_sec / 3600, 1) if sleep_sec else None
                 day_data["sleep_score"] = daily.get("sleepScores", {}).get("overall", {}).get("value")
         except Exception as e:
@@ -1031,7 +1031,7 @@ def get_weekly_summary() -> dict:
             sleep_data = client.get_sleep_data(date_str)
             if sleep_data:
                 daily = sleep_data.get("dailySleepDTO", {})
-                sleep_sec = daily.get("sleepTimeSeconds", 0)
+                sleep_sec = daily.get("sleepTimeSeconds") or 0
                 day["sleep_hours"] = round(sleep_sec / 3600, 1) if sleep_sec else None
         except Exception as e:
             logger.warning(f"Failed to get sleep for {date_str}: {e}")
@@ -1043,7 +1043,7 @@ def get_weekly_summary() -> dict:
     data = [r if r is not None else {"date": date_strs[i]} for i, r in enumerate(raw_results)]
 
     # Calculate summary
-    steps = [d.get("steps", 0) for d in data]
+    steps = [d.get("steps") or 0 for d in data]
     hrs = [d.get("resting_hr") for d in data if d.get("resting_hr")]
     sleep = [d.get("sleep_hours") for d in data if d.get("sleep_hours")]
 
@@ -1445,8 +1445,8 @@ def get_daily_goals_progress(date_str: str = "today") -> dict:
                 "total": stats.get("totalKilocalories", 0),
                 "bmr": stats.get("bmrKilocalories", 0),
             },
-            "distance_km": round(stats.get("totalDistanceMeters", 0) / 1000, 2),
-            "distance_miles": meters_to_miles(stats.get("totalDistanceMeters", 0)),
+            "distance_km": round((stats.get("totalDistanceMeters") or 0) / 1000, 2),
+            "distance_miles": meters_to_miles((stats.get("totalDistanceMeters") or 0)),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1744,10 +1744,10 @@ def get_sleep_quality_trends(days: int = 7) -> dict:
                 if daily.get("sleepTimeSeconds"):
                     return {
                         "date": date_str,
-                        "sleep_hours": round(daily.get("sleepTimeSeconds", 0) / 3600, 1),
-                        "deep_pct": round(daily.get("deepSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
-                        "rem_pct": round(daily.get("remSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
-                        "light_pct": round(daily.get("lightSleepSeconds", 0) / daily.get("sleepTimeSeconds", 1) * 100, 1),
+                        "sleep_hours": round((daily.get("sleepTimeSeconds") or 0) / 3600, 1),
+                        "deep_pct": round((daily.get("deepSleepSeconds") or 0) / (daily.get("sleepTimeSeconds") or 1) * 100, 1),
+                        "rem_pct": round((daily.get("remSleepSeconds") or 0) / (daily.get("sleepTimeSeconds") or 1) * 100, 1),
+                        "light_pct": round((daily.get("lightSleepSeconds") or 0) / (daily.get("sleepTimeSeconds") or 1) * 100, 1),
                         "awake_count": daily.get("awakeSleepCount") or daily.get("awakeCount"),
                         "sleep_score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
                         "avg_hr": daily.get("averageHeartRate") or daily.get("avgHeartRate"),
@@ -1829,9 +1829,9 @@ def get_recovery_metrics() -> dict:
         if sleep:
             daily = sleep.get("dailySleepDTO", {})
             result["last_night_sleep"] = {
-                "hours": round(daily.get("sleepTimeSeconds", 0) / 3600, 1),
+                "hours": round((daily.get("sleepTimeSeconds") or 0) / 3600, 1),
                 "score": daily.get("sleepScores", {}).get("overall", {}).get("value"),
-                "deep_pct": round(daily.get("deepSleepSeconds", 0) / max(daily.get("sleepTimeSeconds", 1), 1) * 100, 1),
+                "deep_pct": round((daily.get("deepSleepSeconds") or 0) / max(daily.get("sleepTimeSeconds") or 1, 1) * 100, 1),
             }
     except Exception as e:
         logger.warning(f"Failed to get sleep data for recovery: {e}")
@@ -1950,7 +1950,7 @@ def _fetch_full_day(client: Garmin, date_str: str) -> dict:
             data = client.get_sleep_data(date_str)
             if data:
                 daily = data.get("dailySleepDTO", {})
-                sleep_sec = daily.get("sleepTimeSeconds", 0)
+                sleep_sec = daily.get("sleepTimeSeconds") or 0
                 start_ts = daily.get("sleepStartTimestampLocal") or daily.get("sleepStartTimestampGMT")
                 end_ts = daily.get("sleepEndTimestampLocal") or daily.get("sleepEndTimestampGMT")
                 return {
