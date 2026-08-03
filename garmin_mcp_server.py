@@ -44,6 +44,18 @@ def meters_to_miles(meters: float) -> float:
     return round(meters * METERS_TO_MILES, 2)
 
 
+def _body_battery_levels(values) -> list:
+    """Return only numeric Body Battery samples from Garmin's point array."""
+    levels = []
+    for point in values or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        level = point[1]
+        if isinstance(level, (int, float)) and not isinstance(level, bool):
+            levels.append(level)
+    return levels
+
+
 def _parallel_fetch(tasks: list) -> list:
     """
     Run a list of (fn, *args) tuples in parallel using the thread pool.
@@ -200,7 +212,7 @@ def get_todays_summary() -> dict:
             summary["body_battery_drained"] = bb_data.get("drained")
             bb_values = bb_data.get("bodyBatteryValuesArray", [])
             if bb_values:
-                levels = [v[1] for v in bb_values if len(v) > 1]
+                levels = _body_battery_levels(bb_values)
                 if levels:
                     summary["body_battery_current"] = levels[-1]
                     summary["body_battery_high"] = max(levels)
@@ -382,7 +394,7 @@ def get_body_battery(date_str: str = "today") -> dict:
             # Extract levels from bodyBatteryValuesArray
             bb_values = bb_data.get("bodyBatteryValuesArray", [])
             if bb_values:
-                levels = [v[1] for v in bb_values if len(v) > 1]
+                levels = _body_battery_levels(bb_values)
                 if levels:
                     result["current_level"] = levels[-1]
                     result["high"] = max(levels)
@@ -908,7 +920,7 @@ def _fetch_day_metrics(client: Garmin, date_str: str, metrics: list) -> dict:
                 bb_data = bb[0]
                 bb_values = bb_data.get("bodyBatteryValuesArray", [])
                 if bb_values:
-                    levels = [v[1] for v in bb_values if len(v) > 1]
+                    levels = _body_battery_levels(bb_values)
                     if levels:
                         day_data["body_battery_high"] = max(levels)
                         day_data["body_battery_low"] = min(levels)
@@ -1843,7 +1855,7 @@ def get_recovery_metrics() -> dict:
             bb_data = bb[0]
             bb_values = bb_data.get("bodyBatteryValuesArray", [])
             if bb_values:
-                levels = [v[1] for v in bb_values if len(v) > 1]
+                levels = _body_battery_levels(bb_values)
                 if levels:
                     result["body_battery"] = {
                         "current": levels[-1],
@@ -2003,7 +2015,7 @@ def _fetch_full_day(client: Garmin, date_str: str) -> dict:
             if bb and isinstance(bb, list) and len(bb) > 0:
                 bb_data = bb[0]
                 bb_values = bb_data.get("bodyBatteryValuesArray", [])
-                levels = [v[1] for v in bb_values if len(v) > 1] if bb_values else []
+                levels = _body_battery_levels(bb_values)
                 return {
                     "charged": bb_data.get("charged"),
                     "drained": bb_data.get("drained"),
