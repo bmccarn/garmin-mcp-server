@@ -2,6 +2,14 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that exposes your Garmin Connect health and fitness data to AI assistants. Ask your AI about your sleep, heart rate, workouts, stress, body battery, and more.
 
+## Architecture preview
+
+![Garmin MCP Server architecture](https://blakemccarn.dev/images/projects/garmin-mcp/architecture-diagram.svg)
+
+*How an AI assistant reaches Garmin Connect through the MCP server. The assistant you use provides the interface.*
+
+[Read the project case study](https://blakemccarn.dev/work/garmin-mcp-server)
+
 ## Features
 
 - **34 tools** covering health metrics, activities, trends, and comparisons
